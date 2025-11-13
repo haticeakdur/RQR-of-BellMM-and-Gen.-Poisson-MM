@@ -1,0 +1,172 @@
+# ============================================================
+# Title: Randomized Quantile Residuals (RQR) & Dunn–Smyth Residuals 
+#        for Mixed Count Models (Bolus Dataset)
+# Author: Hatice Tül Kübra Akdur
+# Collaborator: Prof. Ben Bolker
+# Repository: https://github.com/htkakdur/bolus-RQR-analysis
+# Description:
+#   This script fits Poisson, NB1, NB2, Generalized Poisson, and Bell mixed models 
+#   using glmmTMB, computes both Dunn–Smyth and Randomized Quantile Residuals (RQR),
+#   and generates diagnostic plots.
+# ============================================================
+
+# --- Load required packages ---------------------------------
+suppressPackageStartupMessages({
+  library(glmmTMB)
+  library(dplyr)
+  library(ggplot2)
+  library(HMMpa)
+  library(bellreg)
+  library(LambertW)
+  library(gsl)
+})
+
+# --- Set global options -------------------------------------
+options(scipen = 10, digits = 4)
+set.seed(123)
+
+# ============================================================
+# Custom RQR Functions for Bell and Generalized Poisson
+# ============================================================
+
+# --- Bell Mixed Model RQR -----------------------------------
+rqr_bell <- function(y, mu) {
+  stopifnot(length(y) == length(mu))
+  pval <- numeric(length(y))
+  for (i in seq_along(y)) {
+    if (y[i] == 0) {
+      pval[i] <- dbell(y[i], W(mu[i])) * runif(1)
+    } else {
+      pval[i] <- pbell(y[i] - 1, W(mu[i])) + dbell(y[i], W(mu[i])) * runif(1)
+    }
+  }
+  pval <- pmin(pmax(pval, 1e-10), 1 - 1e-10)
+  qnorm(pval)
+}
+
+# --- Generalized Poisson RQR (Joe & Zhu, 2005 parametrization) ---
+rqr_gp <- function(y, mu, phi_sq) {
+  stopifnot(length(y) == length(mu))
+  if (!is.finite(phi_sq) || phi_sq <= 0)
+    stop("phi_sq must be finite and > 0 (from sigma(gp_mixed)).")
+
+  phi <- sqrt(phi_sq)
+  alpha <- 1 - 1 / phi
+  alpha <- pmin(pmax(alpha, -0.99), 0.999)
+
+  lambda1 <- mu * (1 - alpha)
+  lambda2 <- alpha
+  lambda1 <- pmax(lambda1, 1e-8)
+
+  pval <- suppressWarnings(
+    HMMpa::pgenpois(y - 1, lambda1, lambda2) +
+      HMMpa::dgenpois(y, lambda1, lambda2) * runif(length(y))
+  )
+
+  pval[!is.finite(pval)] <- 0.5
+  pval <- pmin(pmax(pval, 1e-10), 1 - 1e-10)
+  qnorm(pval)
+}
+
+# ============================================================
+# Model Fitting (Bolus Dataset)
+# ============================================================
+
+data("bolus", package = "cold")
+y <- bolus$y
+
+# Fit models with identical random-effects structure
+poi_model  <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = poisson)
+nb1_model  <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = nbinom1)
+nb2_model  <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = nbinom2)
+bell_model <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = glmmTMB::bell())
+gp_model   <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = glmmTMB::genpois())
+
+phi_sq_gp <- sigma(gp_model) # φ² for GP model
+
+# ============================================================
+# Conditional (re.form = NULL) & Marginal (re.form = NA) Means
+# ============================================================
+
+mu_cond <- list(
+  pois  = fitted(poi_model),
+  nb1   = fitted(nb1_model),
+  nb2   = fitted(nb2_model),
+  bell  = fitted(bell_model),
+  gp    = fitted(gp_model)
+)
+
+mu_marg <- list(
+  pois  = predict(poi_model, re.form = NA, type = "response"),
+  nb1   = predict(nb1_model, re.form = NA, type = "response"),
+  nb2   = predict(nb2_model, re.form = NA, type = "response"),
+  bell  = predict(bell_model, re.form = NA, type = "response"),
+  gp    = predict(gp_model, re.form = NA, type = "response")
+)
+
+# ============================================================
+# Compute Dunn–Smyth and Randomized Quantile Residuals
+# ============================================================
+
+rqr_data <- dplyr::bind_rows(
+  data.frame(Model = "Poisson",    Type = "Conditional", RQR = residuals(poi_model, type = "dunn-smyth", re.form = NULL)),
+  data.frame(Model = "Poisson",    Type = "Marginal",    RQR = residuals(poi_model, type = "dunn-smyth", re.form = NA)),
+  data.frame(Model = "NB1",        Type = "Conditional", RQR = residuals(nb1_model, type = "dunn-smyth", re.form = NULL)),
+  data.frame(Model = "NB1",        Type = "Marginal",    RQR = residuals(nb1_model, type = "dunn-smyth", re.form = NA)),
+  data.frame(Model = "NB2",        Type = "Conditional", RQR = residuals(nb2_model, type = "dunn-smyth", re.form = NULL)),
+  data.frame(Model = "NB2",        Type = "Marginal",    RQR = residuals(nb2_model, type = "dunn-smyth", re.form = NA)),
+  data.frame(Model = "BellMM",     Type = "Conditional", RQR = rqr_bell(y, mu_cond$bell)),
+  data.frame(Model = "BellMM",     Type = "Marginal",    RQR = rqr_bell(y, mu_marg$bell)),
+  data.frame(Model = "GenPois",    Type = "Conditional", RQR = rqr_gp(y, mu_cond$gp, phi_sq_gp)),
+  data.frame(Model = "GenPois",    Type = "Marginal",    RQR = rqr_gp(y, mu_marg$gp, phi_sq_gp))
+)
+
+# ============================================================
+# Summary Statistics (Normality Check)
+# ============================================================
+
+summary_rqr <- rqr_data %>%
+  group_by(Model, Type) %>%
+  summarise(
+    Mean = mean(RQR, na.rm = TRUE),
+    SD   = sd(RQR, na.rm = TRUE),
+    Shapiro.p = tryCatch(shapiro.test(RQR)$p.value, error = function(e) NA_real_),
+    .groups = "drop"
+  )
+
+print(summary_rqr)
+
+# ============================================================
+# Visualization: Histogram + Q–Q Plots
+# ============================================================
+
+p_hist <- ggplot(rqr_data, aes(x = RQR, fill = Type)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, alpha = 0.6, color = "black") +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  facet_grid(Model ~ Type) +
+  labs(
+    title = "RQR / Dunn–Smyth Residuals — Histogram + Density",
+    x = "Residuals (RQR)", y = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_qq <- ggplot(rqr_data, aes(sample = RQR, color = Type)) +
+  stat_qq(size = 1, alpha = 0.7) +
+  stat_qq_line(linetype = "dashed", color = "black") +
+  facet_grid(Model ~ Type) +
+  labs(
+    title = "RQR / Dunn–Smyth Residuals — Q–Q Plots",
+    x = "Theoretical Quantiles", y = "Sample Quantiles"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Combine plots (requires patchwork)
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  library(patchwork)
+  (p_hist | p_qq) +
+    plot_annotation(title = "Conditional vs Marginal RQR / Dunn–Smyth Residuals\n(BellMM, Poisson, NB1, NB2, GenPois Models)")
+}
+
+# ============================================================
+# End of Script
+# ============================================================
