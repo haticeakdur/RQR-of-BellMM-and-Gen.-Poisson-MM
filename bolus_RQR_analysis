@@ -21,19 +21,13 @@ suppressPackageStartupMessages({
   library(gsl)
 })
 
-# --- Set global options -------------------------------------
-options(scipen = 10, digits = 4)
-set.seed(123)
-
-# ============================================================
-# Custom RQR Functions for Bell and Generalized Poisson
-# ============================================================
-
-# --- Bell Mixed Model RQR -----------------------------------
+getOption("digits")
+options(scipen = 10,"digits" = 4)
 rqr_bell <- function(y, mu) {
   stopifnot(length(y) == length(mu))
   pval <- numeric(length(y))
   for (i in seq_along(y)) {
+    # dbell / pbell from bellreg expect parameter W(...) as in your previous code
     if (y[i] == 0) {
       pval[i] <- dbell(y[i], W(mu[i])) * runif(1)
     } else {
@@ -44,103 +38,137 @@ rqr_bell <- function(y, mu) {
   qnorm(pval)
 }
 
-# --- Generalized Poisson RQR (Joe & Zhu, 2005 parametrization) ---
 rqr_gp <- function(y, mu, phi_sq) {
+  # phi_sq := sigma(gp_mixed) per glmmTMB doc (phi^2)
   stopifnot(length(y) == length(mu))
-  if (!is.finite(phi_sq) || phi_sq <= 0)
-    stop("phi_sq must be finite and > 0 (from sigma(gp_mixed)).")
-
+  if (!is.finite(phi_sq) || phi_sq <= 0) {
+    stop("phi_sq must be finite and > 0 (sigma(gp_mixed)).")
+  }
+  # Compute alpha from phi: phi = sqrt(phi_sq), alpha = 1 - 1/phi
   phi <- sqrt(phi_sq)
   alpha <- 1 - 1 / phi
+  
+  # Warn if alpha outside typical 0 <= alpha < 1 (HMMpa / Joe & Zhu expects h>=0 typically)
+  if (alpha < -0.99 || alpha >= 1) {
+    warning(sprintf("Computed alpha = %g is outside expected range. Clamping to [-0.99, 0.999].", alpha))
+  }
   alpha <- pmin(pmax(alpha, -0.99), 0.999)
-
+  
+  # Map mu,alpha -> HMMpa params
   lambda1 <- mu * (1 - alpha)
   lambda2 <- alpha
+  
+  # numeric safety
   lambda1 <- pmax(lambda1, 1e-8)
-
+  lambda2 <- pmin(pmax(lambda2, -0.99), 0.999)
+  
+  # compute p-values elementwise (suppress warnings from HMMpa if needed)
   pval <- suppressWarnings(
     HMMpa::pgenpois(y - 1, lambda1, lambda2) +
       HMMpa::dgenpois(y, lambda1, lambda2) * runif(length(y))
   )
-
   pval[!is.finite(pval)] <- 0.5
   pval <- pmin(pmax(pval, 1e-10), 1 - 1e-10)
   qnorm(pval)
 }
 
-# ============================================================
-# Model Fitting (Bolus Dataset)
-# ============================================================
+# (Bolus)
+#------------------------------------------------------------
+poi_model <- glmmTMB(y ~ group * time + (1 + time | id), 
+                         data = bolus, family = poisson)
 
-data("bolus", package = "cold")
+nb1_model<- glmmTMB(y ~ group * time + (1 + time | id), 
+                     data = bolus, family = nbinom1)
+
+nb_model <- glmmTMB(y ~ group * time + (1 + time | id), 
+                     data = bolus, family = nbinom2)
+
+bell_model<- glmmTMB(y ~ group * time + (1 + time | id), 
+                      data = bolus, family = glmmTMB::bell())
+
+gep_model <- glmmTMB(y ~ group * time + (1 + time | id), 
+                    data = bolus, family = glmmTMB::genpois())
+
+
+model_comparison <- data.frame(
+  Model = c("Poisson", "NB1", "NB2", "BellMM", "Gen. Poisson"),
+  AIC = c(AIC(poisson_mixed), AIC(nb1_mixed), AIC(nb2_mixed), AIC(bell_mixed), AIC(gp_mixed)),
+  BIC = c(BIC(poisson_mixed), BIC(nb1_mixed), BIC(nb2_mixed), BIC(bell_mixed), BIC(gp_mixed)),
+  LogLik = c(logLik(poisson_mixed), logLik(nb1_mixed), logLik(nb2_mixed), logLik(bell_mixed), logLik(gp_mixed))
+)
+
+
+phi_sq_gp <- sigma(gep_model) # GP → φ² (Consul & Famoye, glmmTMB doc.)
+data("bolus")
 y <- bolus$y
+# Conditional (random effects )
+mu_poi_c  <- fitted(poi_model)
+mu_nb1_c  <- fitted(nb1_model)
+mu_nb2_c  <- fitted(nb_model)
+mu_bell_c <- fitted(bell_model)
+mu_gp_c   <- fitted(gep_model)
 
-# Fit models with identical random-effects structure
-poi_model  <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = poisson)
-nb1_model  <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = nbinom1)
-nb2_model  <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = nbinom2)
-bell_model <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = glmmTMB::bell())
-gp_model   <- glmmTMB(y ~ group * time + (1 + time | id), data = bolus, family = glmmTMB::genpois())
-
-phi_sq_gp <- sigma(gp_model) # φ² for GP model
+# Unconditional 
+mu_poi_m  <- predict(poi_model,  re.form = NA, type = "response")
+mu_nb1_m  <- predict(nb1_model,  re.form = NA, type = "response")
+mu_nb2_m  <- predict(nb_model,   re.form = NA, type = "response")
+mu_bell_m <- predict(bell_model, re.form = NA, type = "response")
+mu_gp_m   <- predict(gep_model,  re.form = NA, type = "response")
 
 # ============================================================
-# Conditional (re.form = NULL) & Marginal (re.form = NA) Means
+#  RQR 
 # ============================================================
 
-mu_cond <- list(
-  pois  = fitted(poi_model),
-  nb1   = fitted(nb1_model),
-  nb2   = fitted(nb2_model),
-  bell  = fitted(bell_model),
-  gp    = fitted(gp_model)
+# Conditional (birey düzeyinde)
+rqr_poi_cond  <- residuals(poi_model,  type = "dunn-smyth", re.form = NULL)
+rqr_nb1_cond  <- residuals(nb1_model,  type = "dunn-smyth", re.form = NULL)
+rqr_nb2_cond  <- residuals(nb_model,   type = "dunn-smyth", re.form = NULL)
+rqr_gp_cond   <- rqr_gp(y, mu_gp_c, phi_sq_gp)
+rqr_bell_cond <- rqr_bell(y, mu_bell_c)
+
+# Unconditional (popülasyon düzeyinde)
+rqr_poi_uncond  <- residuals(poi_model,  type = "dunn-smyth", re.form = NA)
+rqr_nb1_uncond  <- residuals(nb1_model,  type = "dunn-smyth", re.form = NA)
+rqr_nb2_uncond  <- residuals(nb_model,   type = "dunn-smyth", re.form = NA)
+rqr_gp_uncond   <- rqr_gp(y, mu_gp_m, phi_sq_gp)
+rqr_bell_uncond <- rqr_bell(y, mu_bell_m)
+
+
+# ============================================================
+
+rqr_df <- bind_rows(
+  data.frame(Model = "Poisson", Type = "Conditional", RQR = rqr_poi_cond),
+  data.frame(Model = "Poisson", Type = "Unconditional",    RQR = rqr_poi_uncond),
+  data.frame(Model = "NB1",     Type = "Conditional", RQR = rqr_nb1_cond),
+  data.frame(Model = "NB1",     Type = "Unconditional",    RQR = rqr_nb1_uncond),
+  data.frame(Model = "NB2",     Type = "Conditional", RQR = rqr_nb2_cond),
+  data.frame(Model = "NB2",     Type = "Unconditional",    RQR = rqr_nb2_uncond),
+  data.frame(Model = "BellMM",  Type = "Conditional", RQR = rqr_bell_cond),
+  data.frame(Model = "BellMM",  Type = "Unconditional",    RQR = rqr_bell_uncond),
+  data.frame(Model = "GenPois", Type = "Conditional", RQR = rqr_gp_cond),
+  data.frame(Model = "GenPois", Type = "Unconditional",    RQR = rqr_gp_uncond)
 )
 
-mu_marg <- list(
-  pois  = predict(poi_model, re.form = NA, type = "response"),
-  nb1   = predict(nb1_model, re.form = NA, type = "response"),
-  nb2   = predict(nb2_model, re.form = NA, type = "response"),
-  bell  = predict(bell_model, re.form = NA, type = "response"),
-  gp    = predict(gp_model, re.form = NA, type = "response")
-)
-
 # ============================================================
-# Compute Dunn–Smyth and Randomized Quantile Residuals
+#  Normality(Shapiro–Wilk)
 # ============================================================
 
-rqr_data <- dplyr::bind_rows(
-  data.frame(Model = "Poisson",    Type = "Conditional", RQR = residuals(poi_model, type = "dunn-smyth", re.form = NULL)),
-  data.frame(Model = "Poisson",    Type = "Marginal",    RQR = residuals(poi_model, type = "dunn-smyth", re.form = NA)),
-  data.frame(Model = "NB1",        Type = "Conditional", RQR = residuals(nb1_model, type = "dunn-smyth", re.form = NULL)),
-  data.frame(Model = "NB1",        Type = "Marginal",    RQR = residuals(nb1_model, type = "dunn-smyth", re.form = NA)),
-  data.frame(Model = "NB2",        Type = "Conditional", RQR = residuals(nb2_model, type = "dunn-smyth", re.form = NULL)),
-  data.frame(Model = "NB2",        Type = "Marginal",    RQR = residuals(nb2_model, type = "dunn-smyth", re.form = NA)),
-  data.frame(Model = "BellMM",     Type = "Conditional", RQR = rqr_bell(y, mu_cond$bell)),
-  data.frame(Model = "BellMM",     Type = "Marginal",    RQR = rqr_bell(y, mu_marg$bell)),
-  data.frame(Model = "GenPois",    Type = "Conditional", RQR = rqr_gp(y, mu_cond$gp, phi_sq_gp)),
-  data.frame(Model = "GenPois",    Type = "Marginal",    RQR = rqr_gp(y, mu_marg$gp, phi_sq_gp))
-)
-
-# ============================================================
-# Summary Statistics (Normality Check)
-# ============================================================
-
-summary_rqr <- rqr_data %>%
+summary_table <- rqr_df %>%
   group_by(Model, Type) %>%
   summarise(
-    Mean = mean(RQR, na.rm = TRUE),
-    SD   = sd(RQR, na.rm = TRUE),
+    RQR.mean = mean(RQR, na.rm = TRUE),
+    RQR.sd   = sd(RQR, na.rm = TRUE),
     Shapiro.p = tryCatch(shapiro.test(RQR)$p.value, error = function(e) NA_real_),
     .groups = "drop"
   )
 
-print(summary_rqr)
+print(summary_table)
 
 # ============================================================
-# Visualization: Histogram + Q–Q Plots
+#Histogram + QQ Plot
 # ============================================================
 
-p_hist <- ggplot(rqr_data, aes(x = RQR, fill = Type)) +
+p_hist <- ggplot(rqr_df, aes(x = RQR, fill = Type)) +
   geom_histogram(aes(y = after_stat(density)), bins = 30, alpha = 0.6, color = "black") +
   geom_density(alpha = 0.3, linewidth = 0.8) +
   facet_grid(Model ~ Type) +
@@ -150,7 +178,7 @@ p_hist <- ggplot(rqr_data, aes(x = RQR, fill = Type)) +
   ) +
   theme_minimal(base_size = 12)
 
-p_qq <- ggplot(rqr_data, aes(sample = RQR, color = Type)) +
+p_qq <- ggplot(rqr_df, aes(sample = RQR, color = Type)) +
   stat_qq(size = 1, alpha = 0.7) +
   stat_qq_line(linetype = "dashed", color = "black") +
   facet_grid(Model ~ Type) +
@@ -160,13 +188,5 @@ p_qq <- ggplot(rqr_data, aes(sample = RQR, color = Type)) +
   ) +
   theme_minimal(base_size = 12)
 
-# Combine plots (requires patchwork)
-if (requireNamespace("patchwork", quietly = TRUE)) {
-  library(patchwork)
-  (p_hist | p_qq) +
-    plot_annotation(title = "Conditional vs Marginal RQR / Dunn–Smyth Residuals\n(BellMM, Poisson, NB1, NB2, GenPois Models)")
-}
-
-# ============================================================
-# End of Script
-# ============================================================
+(p_hist | p_qq) + 
+  plot_annotation(title = "Conditional vs Unconditional RQR / Dunn–Smyth Residuals (BellMM, Poisson, NB1, NB2, GenPois Models)")
