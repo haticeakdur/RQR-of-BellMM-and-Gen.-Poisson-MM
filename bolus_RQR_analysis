@@ -27,7 +27,7 @@ rqr_bell <- function(y, mu) {
   stopifnot(length(y) == length(mu))
   pval <- numeric(length(y))
   for (i in seq_along(y)) {
-    # dbell / pbell from bellreg expect parameter W(...) as in your previous code
+    # dbell / pbell from bellreg expect parameter W(...) 
     if (y[i] == 0) {
       pval[i] <- dbell(y[i], W(mu[i])) * runif(1)
     } else {
