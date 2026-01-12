@@ -3,7 +3,7 @@
 #        for Mixed Count Models (Bolus Dataset)
 # Author: Hatice Tül Kübra Akdur
 # Collaborator: Prof. Ben Bolker
-# Repository: https://github.com/htkakdur/bolus-RQR-analysis
+# 
 # Description:
 #   This script fits Poisson, NB1, NB2, Generalized Poisson, and Bell mixed models 
 #   using glmmTMB, computes both Dunn–Smyth and Randomized Quantile Residuals (RQR),
